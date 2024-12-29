@@ -7,446 +7,440 @@ import { promisify } from 'util';
 const writeFileAsync = promisify(fs.writeFile);
 const unlinkAsync = promisify(fs.unlink);
 
-// A map to keep track of active temporary tabs for each original document
 const activeTempTabs: Map<string, TempTab> = new Map();
-
-// Debounce timer map to prevent rapid successive command executions
 const debounceTimers: Map<string, NodeJS.Timeout> = new Map();
-
-// Define a debounce delay in milliseconds
 const DEBOUNCE_DELAY = 10;
 
-// Define decoration types for original editor
 const originalDecorationType = vscode.window.createTextEditorDecorationType({
-	backgroundColor: 'rgba(135,206,250, 0.3)', // Light sky blue with transparency
-	borderRadius: '2px',
+  backgroundColor: 'rgba(135,206,250, 0.3)',
+  borderRadius: '2px',
 });
 
-// Interface to store temporary tab information
 interface TempTab {
-	tempFileName: string;
-	tempUri: vscode.Uri;
-	originalUri: string;
-	disposables: vscode.Disposable[];
-	isProgrammaticSave: boolean;
-	isClosed: boolean;
-	originalRange: vscode.Range; // Changed from Selection to Range
+  tempFileName: string;
+  tempUri: vscode.Uri;
+  originalUri: string;
+  disposables: vscode.Disposable[];
+  isProgrammaticSave: boolean;
+  isClosed: boolean;
+  originalRanges: vscode.Range[]; // Birden fazla aralığı saklamak için dizi
 }
 
 export function activate(context: vscode.ExtensionContext) {
-	const disposable = vscode.commands.registerCommand('extension.separate', async () => {
-		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			vscode.window.showInformationMessage('No active editor found.');
-			return;
-		}
+  const disposable = vscode.commands.registerCommand('extension.separate', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showInformationMessage('No active editor found.');
+      return;
+    }
 
-		const selection = editor.selection;
-		if (selection.isEmpty) {
-			vscode.window.showInformationMessage('Please select some text to separate.');
-			return;
-		}
+    const selections = editor.selections;
+    let selectedText = '';
+    let originalRanges: vscode.Range[] = [];
+    let isAltSelection = false;
 
-		const selectedText = editor.document.getText(selection);
-		if (selectedText.trim().length === 0) {
-			vscode.window.showInformationMessage('Selected text is empty.');
-			return;
-		}
+    // Alt ile çoklu seçim kontrolü (basit yaklaşım)
+    if (selections.length > 1) {
+      isAltSelection = true;
+    }
 
-		const originalUri = editor.document.uri.toString();
+    if (isAltSelection) {
+      // Alt ile seçim yapılmış
+      for (const selection of selections) {
+        selectedText += editor.document.getText(selection) + (selections.indexOf(selection) < selections.length - 1 ? '\n' : '');
+        originalRanges.push(selection);
+      }
+    } else if (selections.length === 1 && !selections[0].isEmpty) {
+      // Tek bir seçim var (Shift veya Ctrl ile yapılmış olabilir)
+      selectedText = editor.document.getText(selections[0]);
+      originalRanges.push(selections[0]);
+    } else {
+      vscode.window.showInformationMessage('Please select some text to separate.');
+      return;
+    }
 
-		// Implement debounce to prevent rapid successive executions
-		if (debounceTimers.has(originalUri)) {
-			clearTimeout(debounceTimers.get(originalUri)!);
-		}
+    if (selectedText.trim().length === 0) {
+      vscode.window.showInformationMessage('Selected text is empty.');
+      return;
+    }
 
-		const timer = setTimeout(async () => {
-			debounceTimers.delete(originalUri);
+    const originalUri = editor.document.uri.toString();
 
-			// Handle existing temp tabs
-			if (activeTempTabs.has(originalUri)) {
-				const existingTempTab = activeTempTabs.get(originalUri)!;
+    if (debounceTimers.has(originalUri)) {
+      clearTimeout(debounceTimers.get(originalUri)!);
+    }
 
-				if (!existingTempTab.isClosed) {
-					// Close the existing temp tab programmatically
-					const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
+    const timer = setTimeout(async () => {
+      debounceTimers.delete(originalUri);
 
-					const tempFileUri = existingTempTab.tempUri;
+      if (activeTempTabs.has(originalUri)) {
+        const existingTempTab = activeTempTabs.get(originalUri)!;
 
-					const tabToClose = allTabs.find(tab => {
-						const input = tab.input;
-						if (input instanceof vscode.TabInputText) {
-							return input.uri.toString() === tempFileUri.toString();
-						}
-						return false;
-					});
+        if (!existingTempTab.isClosed) {
+          const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
+          const tempFileUri = existingTempTab.tempUri;
 
-					if (tabToClose) {
-						try {
-							await vscode.window.tabGroups.close(tabToClose);
-						} catch (error) {
-							vscode.window.showErrorMessage(`Failed to close existing temporary tab: ${error}`);
-						}
-					}
+          const tabToClose = allTabs.find(tab => {
+            const input = tab.input;
+            if (input instanceof vscode.TabInputText) {
+              return input.uri.toString() === tempFileUri.toString();
+            }
+            return false;
+          });
 
-					// Clean up associated resources
-					existingTempTab.disposables.forEach(disposable => disposable.dispose());
-					try {
-						if (fs.existsSync(existingTempTab.tempFileName)) {
-							await unlinkAsync(existingTempTab.tempFileName);
-						}
-					} catch (error) {
-						vscode.window.showErrorMessage(`Failed to delete previous temporary file: ${error}`);
-					}
+          if (tabToClose) {
+            try {
+              await vscode.window.tabGroups.close(tabToClose);
+            } catch (error) {
+              vscode.window.showErrorMessage(`Failed to close existing temporary tab: ${error}`);
+            }
+          }
 
-					existingTempTab.isClosed = true;
-					activeTempTabs.delete(originalUri);
-				}
-			}
+          existingTempTab.disposables.forEach(disposable => disposable.dispose());
+          try {
+            if (fs.existsSync(existingTempTab.tempFileName)) {
+              await unlinkAsync(existingTempTab.tempFileName);
+            }
+          } catch (error) {
+            vscode.window.showErrorMessage(`Failed to delete previous temporary file: ${error}`);
+          }
 
-			// Determine the original file extension
-			const originalExtension = getFileExtension(editor.document.uri);
+          existingTempTab.isClosed = true;
+          activeTempTabs.delete(originalUri);
+        }
+      }
 
-			// Create a temporary file with a unique name and the same extension as the original
-			const tempFileName = path.join(os.tmpdir(), `separate-${Date.now()}${originalExtension ? `.${originalExtension}` : ''}`);
-			try {
-				await writeFileAsync(tempFileName, selectedText);
-			} catch (error) {
-				vscode.window.showErrorMessage(`Failed to create temporary file: ${error}`);
-				return;
-			}
+      const originalExtension = getFileExtension(editor.document.uri);
+      const tempFileName = path.join(os.tmpdir(), `separate-${Date.now()}${originalExtension ? `.${originalExtension}` : ''}`);
+      try {
+        await writeFileAsync(tempFileName, selectedText);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Failed to create temporary file: ${error}`);
+        return;
+      }
 
-			const tempUri = vscode.Uri.file(tempFileName);
+      const tempUri = vscode.Uri.file(tempFileName);
 
-			// Open the temporary file in a new editor
-			let newDoc: vscode.TextDocument;
-			try {
-				newDoc = await vscode.workspace.openTextDocument(tempUri);
-			} catch (error) {
-				vscode.window.showErrorMessage(`Failed to open temporary file: ${error}`);
-				return;
-			}
+      let newDoc: vscode.TextDocument;
+      try {
+        newDoc = await vscode.workspace.openTextDocument(tempUri);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Failed to open temporary file: ${error}`);
+        return;
+      }
 
-			// Ensure the language mode matches the original
-			if (editor.document.languageId) {
-				await vscode.languages.setTextDocumentLanguage(newDoc, editor.document.languageId);
-			}
+      if (editor.document.languageId) {
+        await vscode.languages.setTextDocumentLanguage(newDoc, editor.document.languageId);
+      }
 
-			try {
-				await vscode.window.showTextDocument(newDoc, vscode.ViewColumn.Beside, false);
-			} catch (error) {
-				vscode.window.showErrorMessage(`Failed to show temporary document: ${error}`);
-				return;
-			}
+      try {
+        await vscode.window.showTextDocument(newDoc, vscode.ViewColumn.Beside, false);
+      } catch (error) {
+        vscode.window.showErrorMessage(`Failed to show temporary document: ${error}`);
+        return;
+      }
 
-			// Create a TempTab object to keep track
-			const tempTab: TempTab = {
-				tempFileName,
-				tempUri,
-				originalUri,
-				disposables: [],
-				isProgrammaticSave: false,
-				isClosed: false,
-				originalRange: selection,
-			};
+      const tempTab: TempTab = {
+        tempFileName,
+        tempUri,
+        originalUri,
+        disposables: [],
+        isProgrammaticSave: false,
+        isClosed: false,
+        originalRanges,
+      };
 
-			activeTempTabs.set(originalUri, tempTab);
+      activeTempTabs.set(originalUri, tempTab);
 
-			// Sync changes between original and extracted documents
-			syncDocuments(editor.document, newDoc, tempTab);
+      syncDocuments(editor.document, newDoc, tempTab);
 
-			// Immediately update decorations for the selection
-			const originalEditor = vscode.window.visibleTextEditors.find(
-				editor => editor.document.uri.toString() === originalUri
-			);
+      const originalEditor = vscode.window.visibleTextEditors.find(
+        editor => editor.document.uri.toString() === originalUri
+      );
 
-			if (originalEditor) {
-				originalEditor.setDecorations(originalDecorationType, [selection]);
-			}
-		}, DEBOUNCE_DELAY);
+      if (originalEditor) {
+        originalEditor.setDecorations(originalDecorationType, originalRanges);
+      }
+    }, DEBOUNCE_DELAY);
 
-		debounceTimers.set(originalUri, timer);
-	});
+    debounceTimers.set(originalUri, timer);
+  });
 
-	context.subscriptions.push(disposable);
+  context.subscriptions.push(disposable);
+  context.subscriptions.push(originalDecorationType);
 
-	// Register decoration types for disposal
-	context.subscriptions.push(originalDecorationType);
-
-	// Global listener for save events
-	const saveListener = vscode.workspace.onDidSaveTextDocument(async (doc) => {
-		// Iterate through activeTempTabs to check if the saved doc is a temporary tab
-		activeTempTabs.forEach(async (tempTab) => {
-			if (doc.uri.fsPath === tempTab.tempUri.fsPath) {
-				if (!tempTab.isProgrammaticSave) {
-					// User manually saved the temporary document, save the original document
-					const originalDoc = vscode.workspace.textDocuments.find(d => d.uri.toString() === tempTab.originalUri);
-					if (originalDoc) {
-						try {
-							await originalDoc.save();
-							vscode.window.showInformationMessage('Original document saved successfully.');
-						} catch (error) {
-							vscode.window.showErrorMessage(`Failed to save original document: ${error}`);
-						}
-					}
-				}
-			}
-		});
-	});
-	context.subscriptions.push(saveListener);
+  const saveListener = vscode.workspace.onDidSaveTextDocument(async (doc) => {
+    activeTempTabs.forEach(async (tempTab) => {
+      if (doc.uri.fsPath === tempTab.tempUri.fsPath) {
+        if (!tempTab.isProgrammaticSave) {
+          const originalDoc = vscode.workspace.textDocuments.find(d => d.uri.toString() === tempTab.originalUri);
+          if (originalDoc) {
+            try {
+              await originalDoc.save();
+              vscode.window.showInformationMessage('Original document saved successfully.');
+            } catch (error) {
+              vscode.window.showErrorMessage(`Failed to save original document: ${error}`);
+            }
+          }
+        }
+      }
+    });
+  });
+  context.subscriptions.push(saveListener);
 }
 
-// Helper function to get file extension from a URI
 function getFileExtension(uri: vscode.Uri): string | null {
-	const ext = path.extname(uri.fsPath);
-	if (ext.startsWith('.')) {
-		return ext.slice(1);
-	}
-	return null;
+  const ext = path.extname(uri.fsPath);
+  if (ext.startsWith('.')) {
+    return ext.slice(1);
+  }
+  return null;
 }
 
 function debounce(func: (...args: any[]) => void, delay: number) {
-	let timer: NodeJS.Timeout;
-	return (...args: any[]) => {
-		clearTimeout(timer);
-		timer = setTimeout(() => {
-			func(...args);
-		}, delay);
-	};
+  let timer: NodeJS.Timeout;
+  return (...args: any[]) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      func(...args);
+    }, delay);
+  };
 }
 
 function syncDocuments(originalDoc: vscode.TextDocument, extractedDoc: vscode.TextDocument, tempTab: TempTab) {
-	let isUpdating = false;
-	let originalRange = tempTab.originalRange;
-	let pendingChanges: vscode.TextDocumentContentChangeEvent[] = [];
-	let processingTimeout: NodeJS.Timeout | null = null;
+  let isUpdating = false;
+  let originalRanges = tempTab.originalRanges;
+  let pendingChanges: { range: vscode.Range, text: string, rangeOffset: number, rangeLength: number }[] = [];
+  let processingTimeout: NodeJS.Timeout | null = null;
 
-	// Debounce the autosave function with a delay of 300ms
-	const debouncedAutosave = debounce(async () => {
-		if (tempTab.isClosed) { return; }
+  const debouncedAutosave = debounce(async () => {
+    if (tempTab.isClosed) { return; }
 
-		tempTab.isProgrammaticSave = true;
-		try {
-			if (tempTab.isClosed) { return; }
-			await extractedDoc.save();
-		} catch (error) {
-			vscode.window.showErrorMessage(`Failed to save temporary file: ${error}`);
-		} finally {
-			tempTab.isProgrammaticSave = false;
-		}
-	}, 300);
+    tempTab.isProgrammaticSave = true;
+    try {
+      if (tempTab.isClosed) { return; }
+      await extractedDoc.save();
+    } catch (error) {
+      vscode.window.showErrorMessage(`Failed to save temporary file: ${error}`);
+    } finally {
+      tempTab.isProgrammaticSave = false;
+    }
+  }, 300);
 
-	// Function to update decorations
-	const updateDecorations = () => {
-		const originalEditor = vscode.window.visibleTextEditors.find(
-			editor => editor.document.uri.toString() === originalDoc.uri.toString()
-		);
+  const updateDecorations = () => {
+    const originalEditor = vscode.window.visibleTextEditors.find(
+      editor => editor.document.uri.toString() === originalDoc.uri.toString()
+    );
 
-		if (originalEditor) {
-			originalEditor.setDecorations(originalDecorationType, []);
-			const originalRangeDeco = new vscode.Range(originalRange.start, originalRange.end);
-			originalEditor.setDecorations(originalDecorationType, [originalRangeDeco]);
-		}
-	};
+    if (originalEditor) {
+      originalEditor.setDecorations(originalDecorationType, []);
+      originalEditor.setDecorations(originalDecorationType, originalRanges);
+    }
+  };
 
-	// Function to clear decorations
-	const clearDecorations = () => {
-		const originalEditor = vscode.window.visibleTextEditors.find(
-			editor => editor.document.uri.toString() === originalDoc.uri.toString()
-		);
+  const clearDecorations = () => {
+    const originalEditor = vscode.window.visibleTextEditors.find(
+      editor => editor.document.uri.toString() === originalDoc.uri.toString()
+    );
 
-		if (originalEditor) {
-			originalEditor.setDecorations(originalDecorationType, []);
-		}
-	};
+    if (originalEditor) {
+      originalEditor.setDecorations(originalDecorationType, []);
+    }
+  };
 
-	// Function to process pending changes
-	async function processPendingChanges() {
-		if (!originalDoc || originalDoc.isClosed || pendingChanges.length === 0) { return; }
+  async function processPendingChanges() {
+    if (!originalDoc || originalDoc.isClosed || pendingChanges.length === 0) { return; }
 
-		const changes = [...pendingChanges];
-		pendingChanges = [];
+    const changes = [...pendingChanges];
+    pendingChanges = [];
 
-		let newStart = originalRange.start;
-		let newEnd = originalRange.end;
+    let newRanges: vscode.Range[] = [...originalRanges];
 
-		for (const change of changes) {
-			const changeStart = change.range.start;
-			const changeEnd = change.range.end;
-			const isInsertion = change.text.length > 0;
+    for (const change of changes) {
+      const changeStart = change.range.start;
+      const changeEnd = change.range.end;
 
-			// Check if change is before the selection
-			if (changeEnd.isBefore(newStart)) {
-				// Adjust both newStart and newEnd
-				const lineDelta = change.text.split('\n').length - 1 - (changeEnd.line - changeStart.line);
-				const charDelta = change.text.length - (changeEnd.character - changeStart.character);
+      newRanges = newRanges.map(originalRange => {
+        let newStart = originalRange.start;
+        let newEnd = originalRange.end;
 
-				newStart = newStart.translate(lineDelta, changeEnd.line === newStart.line ? charDelta : 0);
-				newEnd = newEnd.translate(lineDelta, changeEnd.line === newEnd.line ? charDelta : 0);
-			} else if (changeStart.isAfter(newEnd)) {
-				// Change is after the selection; no adjustment needed
-			} else {
-				// Change overlaps with or is adjacent to the selection
-				if (changeStart.isBefore(newStart)) {
-					const lineDelta = change.text.split('\n').length - 1 - (changeEnd.line - changeStart.line);
-					const charDelta = change.text.length - (changeEnd.character - changeStart.character);
+        // Değişiklik seçimin öncesindeyse
+        if (changeEnd.isBeforeOrEqual(newStart)) {
+          const lineDelta = change.text.split('\n').length - 1 - (changeEnd.line - changeStart.line);
+          const charDelta = change.text.length - (changeEnd.character - changeStart.character);
 
-					newStart = newStart.translate(lineDelta, changeEnd.line === newStart.line ? charDelta : 0);
-				}
-				if (changeEnd.isAfter(newEnd)) {
-					// Adjust newEnd if the change extends beyond the current selection
-					const lineDelta = change.text.split('\n').length - 1 - (changeEnd.line - changeStart.line);
-					const charDelta = change.text.length - (changeEnd.character - changeStart.character);
+          newStart = newStart.translate(lineDelta, changeEnd.line === newStart.line ? charDelta : 0);
+          newEnd = newEnd.translate(lineDelta, changeEnd.line === newEnd.line ? charDelta : 0);
+        }
+        // Değişiklik seçimin içindeyse veya bitişiğindeyse
+        else if (changeStart.isBeforeOrEqual(newEnd)) {
+          const textLines = change.text.split('\n');
+          const lineDelta = textLines.length - 1 - (change.range.end.line - change.range.start.line);
+          const isInserting = change.text.length > 0;
 
-					newEnd = newEnd.translate(lineDelta, changeEnd.line === newEnd.line ? charDelta : 0);
-				} else {
-					// Adjust newEnd based on the change
-					const lineDelta = change.text.split('\n').length - 1 - (changeEnd.line - changeStart.line);
-					const charDelta = change.text.length - (changeEnd.character - changeStart.character);
+          if (isInserting) {
+            // Seçimin başlangıcına ekleme yapılıyorsa
+            if (changeStart.isBefore(newStart)) {
+              newStart = newStart.with(changeStart.line, changeStart.character);
+            }
+            // Seçimin sonuna ekleme yapılıyorsa
+            if (changeEnd.isAfter(newEnd)) {
+              newEnd = newEnd.with(changeEnd.line + lineDelta, (textLines.length === 1 ? changeEnd.character : textLines[textLines.length - 1].length));
+            } else {
+              newEnd = newEnd.translate(lineDelta, changeEnd.line === newEnd.line ? change.text.length - (changeEnd.character - changeStart.character) : 0);
+            }
+          } else {
+            // Silme işlemi
+            newEnd = newEnd.translate(lineDelta, -(changeEnd.character - changeStart.character));
+          }
+        }
 
-					newEnd = newEnd.translate(lineDelta, changeEnd.line === newEnd.line ? charDelta : 0);
-				}
+        return new vscode.Range(newStart, newEnd);
+      });
+    }
 
-				// If it's an insertion adjacent to the selection, expand the selection
-				if (isInsertion) {
-					// Check if insertion is adjacent to the selection
-					if (changeStart.isEqual(newEnd) || changeEnd.isEqual(newStart)) {
-						const insertedLines = change.text.split('\n').length - 1;
-						const lastLine = change.text.split('\n').pop() || '';
-						const insertedChars = insertedLines > 0 ? lastLine.length : change.text.length;
+    originalRanges = newRanges;
 
-						if (changeStart.isEqual(newEnd)) {
-							// Insertion after the selection
-							newEnd = newEnd.translate(insertedLines, insertedLines > 0 ? insertedChars - newEnd.character : insertedChars);
-						} else if (changeEnd.isEqual(newStart)) {
-							// Insertion before the selection
-							newStart = newStart.translate(insertedLines, insertedLines > 0 ? insertedChars - newStart.character : insertedChars);
-						}
-					}
-				}
-			}
-		}
+    // Yeni içeriği oluştur
+    let newText = '';
+    for (const range of originalRanges) {
+      newText += originalDoc.getText(range) + (originalRanges.indexOf(range) < originalRanges.length - 1 ? '\n' : '');
+    }
 
-		originalRange = new vscode.Range(newStart, newEnd);
+    // Güncellenmiş aralığı hesapla
+    const fullRange = new vscode.Range(
+      extractedDoc.positionAt(0),
+      extractedDoc.positionAt(extractedDoc.getText().length)
+    );
 
-		// Update the extracted document with the new content
-		const newText = originalDoc.getText(originalRange);
-		const edit = new vscode.WorkspaceEdit();
-		const fullRange = new vscode.Range(
-			extractedDoc.positionAt(0),
-			extractedDoc.positionAt(extractedDoc.getText().length)
-		);
-		edit.replace(extractedDoc.uri, fullRange, newText);
-		await vscode.workspace.applyEdit(edit);
+    // Düzenlemeyi uygula
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(extractedDoc.uri, fullRange, newText);
+    await vscode.workspace.applyEdit(edit);
 
-		// Update tempTab's originalRange
-		tempTab.originalRange = originalRange;
+    // TempTab'ın originalRanges'ını güncelle
+    tempTab.originalRanges = originalRanges;
 
-		// Update decorations
-		updateDecorations();
+    // Dekorasyonları güncelle
+    updateDecorations();
 
-		// Trigger debounced autosave
-		debouncedAutosave();
-	}
+    // Gecikmeli otomatik kaydetmeyi tetikle
+    debouncedAutosave();
+  }
 
-	// Listener for changes in the original document
-	const originalToExtracted = vscode.workspace.onDidChangeTextDocument(async originalEvent => {
-		if (tempTab.isClosed || isUpdating ||
-			originalEvent.document.uri.toString() !== originalDoc.uri.toString()) {
-			return;
-		}
+  const originalToExtracted = vscode.workspace.onDidChangeTextDocument(async originalEvent => {
+    if (tempTab.isClosed || isUpdating || originalEvent.document.uri.toString() !== originalDoc.uri.toString()) {
+      return;
+    }
 
-		isUpdating = true;
+    isUpdating = true;
 
-		pendingChanges.push(...originalEvent.contentChanges);
+    for (const change of originalEvent.contentChanges) {
+      pendingChanges.push({
+        range: change.range,
+        text: change.text,
+        rangeOffset: change.rangeOffset,
+        rangeLength: change.rangeLength
+      });
+    }
 
-		if (processingTimeout) {
-			clearTimeout(processingTimeout);
-		}
+    if (processingTimeout) {
+      clearTimeout(processingTimeout);
+    }
 
-		processingTimeout = setTimeout(async () => {
-			await processPendingChanges();
-			processingTimeout = null;
-			isUpdating = false;
-			updateDecorations();
-		}, 10);
-	});
+    processingTimeout = setTimeout(async () => {
+      await processPendingChanges();
+      processingTimeout = null;
+      isUpdating = false;
+      updateDecorations();
+    }, 10);
+  });
 
-	// Listener for changes in the extracted document
-	const extractedToOriginal = vscode.workspace.onDidChangeTextDocument(async extractedEvent => {
-		if (tempTab.isClosed || isUpdating ||
-			extractedEvent.document.uri.toString() !== extractedDoc.uri.toString()) {
-			return;
-		}
+  const extractedToOriginal = vscode.workspace.onDidChangeTextDocument(async extractedEvent => {
+    if (tempTab.isClosed || isUpdating || extractedEvent.document.uri.toString() !== extractedDoc.uri.toString()) {
+      return;
+    }
 
-		isUpdating = true;
+    isUpdating = true;
 
-		const newText = extractedDoc.getText();
-		const edit = new vscode.WorkspaceEdit();
-		edit.replace(originalDoc.uri, originalRange, newText);
-		await vscode.workspace.applyEdit(edit);
+    const newText = extractedDoc.getText();
+    const edits = new vscode.WorkspaceEdit();
 
-		originalRange = new vscode.Range(
-			originalRange.start,
-			originalRange.start.translate(
-				newText.split('\n').length - 1,
-				newText.length
-			)
-		);
+    // Her bir originalRange için ayrı ayrı düzenleme yap
+    let currentIndex = 0;
+    for (let i = 0; i < originalRanges.length; i++) {
+      const range = originalRanges[i];
+      const nextIndex = newText.indexOf('\n', currentIndex);
+      const textForRange = nextIndex !== -1 && i < originalRanges.length - 1
+        ? newText.substring(currentIndex, nextIndex)
+        : newText.substring(currentIndex);
 
-		tempTab.originalRange = originalRange;
-		updateDecorations();
-		debouncedAutosave();
+      edits.replace(originalDoc.uri, range, textForRange);
+      currentIndex += textForRange.length + (i < originalRanges.length - 1 ? 1 : 0);
+    }
 
-		isUpdating = false;
-	});
+    await vscode.workspace.applyEdit(edits);
 
-	// Listener for closing the extracted document
-	const closeHandler = vscode.window.onDidChangeVisibleTextEditors(async () => {
-		const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
-		const tempFileUri = vscode.Uri.file(tempTab.tempFileName);
-		const isExtractedDocVisible = allTabs.some(tab => {
-			const tabUri = tab.input instanceof vscode.TabInputText ? tab.input.uri : null;
-			return tabUri && tabUri.toString().toLowerCase() === tempFileUri.toString().toLowerCase();
-		});
+    // originalRanges'ı güncelle
+    const updatedOriginalRanges = [];
+    let textIndex = 0;
+    for (const range of originalRanges) {
+      const rangeText = extractedDoc.getText().substring(textIndex).split('\n')[0];
+      const end = range.start.translate(0, rangeText.length);
+      updatedOriginalRanges.push(new vscode.Range(range.start, end));
+      textIndex += rangeText.length + 1;
+    }
+    originalRanges = updatedOriginalRanges;
 
-		if (!isExtractedDocVisible) {
-			tempTab.isClosed = true;
-			clearDecorations();
-			tempTab.disposables.forEach(disposable => disposable.dispose());
+    tempTab.originalRanges = originalRanges;
+    updateDecorations();
+    debouncedAutosave();
 
-			if (fs.existsSync(tempTab.tempFileName)) {
-				try {
-					await unlinkAsync(tempTab.tempFileName);
-				} catch (error) {
-					vscode.window.showErrorMessage(`Failed to delete temporary file: ${error}`);
-				}
-			}
+    isUpdating = false;
+  });
 
-			activeTempTabs.delete(tempTab.originalUri);
-		}
-	});
+  const closeHandler = vscode.window.onDidChangeVisibleTextEditors(async () => {
+    const allTabs = vscode.window.tabGroups.all.flatMap(group => group.tabs);
+    const tempFileUri = vscode.Uri.file(tempTab.tempFileName);
+    const isExtractedDocVisible = allTabs.some(tab => {
+      const tabUri = tab.input instanceof vscode.TabInputText ? tab.input.uri : null;
+      return tabUri && tabUri.toString().toLowerCase() === tempFileUri.toString().toLowerCase();
+    });
 
-	tempTab.disposables.push(originalToExtracted, extractedToOriginal, closeHandler);
+    if (!isExtractedDocVisible) {
+      tempTab.isClosed = true;
+      clearDecorations();
+      tempTab.disposables.forEach(disposable => disposable.dispose());
+
+      if (fs.existsSync(tempTab.tempFileName)) {
+        try {
+          await unlinkAsync(tempTab.tempFileName);
+        } catch (error) {
+          vscode.window.showErrorMessage(`Failed to delete temporary file: ${error}`);
+        }
+      }
+
+      activeTempTabs.delete(tempTab.originalUri);
+    }
+  });
+
+  tempTab.disposables.push(originalToExtracted, extractedToOriginal, closeHandler);
 }
 
 export function deactivate() {
-	// Clean up all active temporary tabs on extension deactivation
-	activeTempTabs.forEach(async (tempTab) => {
-		try {
-			await unlinkAsync(tempTab.tempFileName);
-		} catch (error) {
-			console.error(`Failed to delete temporary file during deactivation: ${error}`);
-		}
-		tempTab.disposables.forEach(disposable => disposable.dispose());
-	});
+  activeTempTabs.forEach(async (tempTab) => {
+    try {
+      await unlinkAsync(tempTab.tempFileName);
+    } catch (error) {
+      console.error(`Failed to delete temporary file during deactivation: ${error}`);
+    }
+    tempTab.disposables.forEach(disposable => disposable.dispose());
+  });
 
-	// Clear all decorations
-	const visibleEditors = vscode.window.visibleTextEditors;
-	visibleEditors.forEach(editor => {
-		editor.setDecorations(originalDecorationType, []);
-	});
+  const visibleEditors = vscode.window.visibleTextEditors;
+  visibleEditors.forEach(editor => {
+    editor.setDecorations(originalDecorationType, []);
+  });
 
-	// Dispose decoration types
-	originalDecorationType.dispose();
+  originalDecorationType.dispose();
 }
